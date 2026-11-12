@@ -40,6 +40,7 @@ from torch_checkpointing.hf.metadata import (
 from torch_checkpointing.logging_utils import checkpoint_logging_context
 from torch_checkpointing.schema import ItemSpec
 from torch_checkpointing.storage.filesystem import LocalFileSystemStorageConfig
+from torch_checkpointing.storage.fsspec_storage import FsspecStorageConfig
 from torchtitan.components.checkpointer import (
     CheckpointManager,
     CheckpointStorage,
@@ -205,26 +206,108 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
         barrier_config = backend_config.save.writer_config.barrier_config
         self.assertIsInstance(barrier_config, DefaultStoreBarrierConfig)
 
-    def test_remote_checkpoint_paths_are_rejected_at_construction(self) -> None:
-        # Path() would turn "gs://bucket/x" into "gs:/bucket/x". Rejecting the
-        # two roots up front is what lets every path derived from them be
-        # converted without a further check -- and a save with retention off
-        # reaches the backend having run no probe that could have caught it.
-        for field, kwargs in (
-            ("checkpointer.folder", {"folder": "gs://bucket/checkpoint"}),
-            (
-                "checkpointer.initial_load_path",
-                {"initial_load_path": "gs://bucket/pretrained"},
-            ),
+    def test_remote_folder_uses_fsspec_storage_and_scheme_less_save_ids(self) -> None:
+        # The backend wraps every path in Path(), which would turn
+        # "gs://bucket/x" into "gs:/bucket/x". It is addressed without the
+        # scheme, and the protocol travels in the storage config instead.
+        config = TorchCheckpointingManager.Config(
+            folder="gs://bucket/run/checkpoint/",
+            interval=3,
+            keep_latest_k=0,
+            initial_load_model_only=False,
+        )
+        with mock.patch.object(
+            FsspecStorageConfig, "create_storage", return_value=mock.Mock()
         ):
-            with self.subTest(field=field):
+            manager, backend_manager = self._build_manager(config)
+
+        self.assertEqual("gs://bucket/run/checkpoint/", manager.folder)
+        storage_config = manager._manager_config.storage_config
+        self.assertIsInstance(storage_config, FsspecStorageConfig)
+        self.assertEqual("gs", storage_config.protocol)
+
+        self.assertTrue(manager.save(curr_step=3))
+        self.assertEqual(
+            "bucket/run/checkpoint/step-3", backend_manager.save_calls[0][0]
+        )
+        backend_manager.save_result.set_result(None)
+        manager.close()
+
+    def test_remote_folder_is_probed_and_loaded_by_scheme_less_path(self) -> None:
+        storage = mock.Mock()
+        storage.ls.return_value = ["step-7"]
+        storage.exists.return_value = True
+        storage.isdir.side_effect = lambda path: not str(path).endswith("metadata.pkl")
+        config = TorchCheckpointingManager.Config(
+            folder="gs://bucket/run/checkpoint",
+            keep_latest_k=0,
+            initial_load_model_only=False,
+            load_only=True,
+        )
+        with mock.patch.object(
+            FsspecStorageConfig, "create_storage", return_value=storage
+        ):
+            manager, backend_manager = self._build_manager(config)
+
+        self.assertTrue(manager.load())
+
+        storage.ls.assert_called_with(Path("bucket/run/checkpoint"))
+        self.assertEqual(
+            "bucket/run/checkpoint/step-7", backend_manager.load_calls[0][0]
+        )
+        manager.close()
+
+    def test_caller_supplied_storage_config_wins_for_a_remote_folder(self) -> None:
+        storage_config = mock.Mock()
+        storage_config.create_storage.return_value = mock.Mock()
+        config = TorchCheckpointingManager.Config(
+            folder="gs://bucket/run/checkpoint",
+            keep_latest_k=0,
+        )
+
+        manager, _ = self._build_manager(config, storage_config=storage_config)
+
+        self.assertIs(storage_config, manager._manager_config.storage_config)
+        manager.close()
+
+    def test_folder_and_initial_load_path_must_share_storage(self) -> None:
+        # A manager has one storage, so it cannot read from one and write to
+        # another.
+        for folder, initial_load_path in (
+            ("gs://bucket/checkpoint", "/data/pretrained"),
+            ("checkpoint", "gs://bucket/pretrained"),
+            ("gs://bucket/checkpoint", "s3://bucket/pretrained"),
+        ):
+            with self.subTest(folder=folder, initial_load_path=initial_load_path):
                 config = TorchCheckpointingManager.Config(
+                    folder=folder,
                     keep_latest_k=0,
                     initial_load_model_only=True,
-                    **kwargs,
+                    initial_load_path=initial_load_path,
                 )
-                with self.assertRaisesRegex(ValueError, rf"{field}.*not yet supported"):
-                    self._build_manager(config)
+                with mock.patch.object(
+                    FsspecStorageConfig, "create_storage", return_value=mock.Mock()
+                ):
+                    with self.assertRaisesRegex(ValueError, "same storage"):
+                        self._build_manager(config)
+
+    def test_remote_folder_rejects_hf_initial_load(self) -> None:
+        # The config check only sees a remote initial_load_path. HF assets on
+        # local disk with a remote folder would be read through the wrong
+        # storage.
+        config = TorchCheckpointingManager.Config(
+            folder="gs://bucket/checkpoint",
+            keep_latest_k=0,
+            initial_load_model_only=True,
+            initial_load_in_hf=True,
+        )
+        with mock.patch.object(
+            FsspecStorageConfig, "create_storage", return_value=mock.Mock()
+        ):
+            with self.assertRaisesRegex(ValueError, "initial_load_in_hf.*remote"):
+                self._build_manager(
+                    config, sd_adapter=_StateDictAdapter(hf_assets_path="/data/hf")
+                )
 
     def test_storage_config_is_an_init_parameter_not_a_config_field(self) -> None:
         # Backend storage is a live object, so it is passed programmatically
