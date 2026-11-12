@@ -270,6 +270,13 @@ class TorchCheckpointingManager(BaseCheckpointManager):
                     f"be on the same storage, got {self.folder!r} and "
                     f"{config.initial_load_path!r}."
                 )
+        # BaseCheckpointManager.Config checks only config.folder, which may be
+        # relative to a remote base_folder.
+        if folder_protocol is not None and config.last_save_in_hf:
+            raise ValueError(
+                "checkpointer.last_save_in_hf is not supported with a remote "
+                f"checkpointer.folder: {self.folder!r}"
+            )
         if folder_protocol is not None and config.initial_load_in_hf:
             raise ValueError(
                 "checkpointer.initial_load_in_hf is not supported with a remote "
