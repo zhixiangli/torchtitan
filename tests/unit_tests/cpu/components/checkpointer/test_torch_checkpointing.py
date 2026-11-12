@@ -11,12 +11,14 @@ import os
 import queue
 import tempfile
 import unittest
+import uuid
 from concurrent.futures import Future
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
+import fsspec
 import torch
 import torch.nn as nn
 
@@ -1391,18 +1393,24 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
         manager.close()
 
     def test_load_latest_ignores_incomplete_checkpoint_directories(self) -> None:
+        bucket = f"bucket-{uuid.uuid4().hex}"
+        memory_fs = fsspec.filesystem("memory")
+        self.addCleanup(
+            lambda: memory_fs.rm(bucket, recursive=True)
+            if memory_fs.exists(bucket)
+            else None
+        )
         with tempfile.TemporaryDirectory() as base_folder:
             checkpoint_folder = os.path.join(base_folder, "checkpoint")
+            memory_folder = f"{bucket}/checkpoint"
             for step in (2, 5):
                 checkpoint_id = os.path.join(checkpoint_folder, f"step-{step}")
                 os.makedirs(checkpoint_id)
                 with open(os.path.join(checkpoint_id, "metadata.pkl"), "wb"):
                     pass
-            incomplete_checkpoint_id = os.path.join(checkpoint_folder, "step-8")
-            os.makedirs(incomplete_checkpoint_id)
-            # An interrupted save leaves its metadata behind, so the temporary
-            # directory looks complete. Resuming from it would build the id
-            # "step-9", which does not exist.
+                memory_fs.pipe_file(f"{memory_folder}/step-{step}/metadata.pkl", b"")
+            os.makedirs(os.path.join(checkpoint_folder, "step-8"))
+            memory_fs.makedirs(f"{memory_folder}/step-8", exist_ok=True)
             # Neither is a checkpoint id we could reconstruct: "tmp_step-9" is
             # an interrupted save whose metadata already landed, so it looks
             # complete, and "step-99.partial" is not a name we write at all.
@@ -1412,21 +1420,34 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
                 os.makedirs(decoy_id)
                 with open(os.path.join(decoy_id, "metadata.pkl"), "wb"):
                     pass
-            config = TorchCheckpointingManager.Config(
-                folder="checkpoint",
-                keep_latest_k=0,
-                initial_load_model_only=False,
-                load_only=True,
-            )
-            manager, backend_manager = self._build_manager(
-                config,
-                base_folder=base_folder,
-            )
+                memory_fs.pipe_file(f"{memory_folder}/{decoy}/metadata.pkl", b"")
+            # file:// and memory://<bucket>/ go through the real fsspec storage;
+            # the authority-bearing memory:// URI also catches Path() collapsing
+            # the double slash the way it would on gs://<bucket>/.
+            for folder, expected_id in (
+                ("checkpoint", os.path.join(checkpoint_folder, "step-5")),
+                (
+                    f"file://{checkpoint_folder}",
+                    os.path.join(checkpoint_folder, "step-5"),
+                ),
+                (f"memory://{memory_folder}", f"{memory_folder}/step-5"),
+            ):
+                with self.subTest(folder=folder):
+                    config = TorchCheckpointingManager.Config(
+                        folder=folder,
+                        keep_latest_k=0,
+                        initial_load_model_only=False,
+                        load_only=True,
+                    )
+                    manager, backend_manager = self._build_manager(
+                        config,
+                        base_folder=base_folder,
+                    )
 
-            self.assertTrue(manager.load())
+                    self.assertTrue(manager.load())
 
-            self.assertEqual(
-                os.path.join(checkpoint_folder, "step-5"),
-                backend_manager.load_calls[0][0],
-            )
-            manager.close()
+                    self.assertEqual(
+                        expected_id,
+                        backend_manager.load_calls[0][0],
+                    )
+                    manager.close()
