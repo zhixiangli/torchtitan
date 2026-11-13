@@ -293,6 +293,45 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
                     adapter.isdir(path)
                 storage.isdir.assert_not_called()
 
+    def test_remote_folder_round_trip(self) -> None:
+        """Save and resume through a URI folder with the real backend."""
+        with tempfile.TemporaryDirectory() as base_folder:
+            folder = f"file://{base_folder}/checkpoint"
+
+            def build(model: nn.Module, **overrides) -> TorchCheckpointingManager:
+                return TorchCheckpointingManager.Config(
+                    folder=folder,
+                    keep_latest_k=0,
+                    initial_load_model_only=False,
+                    last_save_model_only=False,
+                    **overrides,
+                ).build(
+                    model_parts=[model],
+                    optimizers=_Stateful("optimizer"),
+                    lr_schedulers=_Stateful("scheduler"),
+                    ema=None,
+                    extra_states={"train_state": _Stateful("train")},
+                    sd_adapter=None,
+                )
+
+            saved = nn.Linear(2, 2)
+            manager = build(saved)
+            try:
+                self.assertTrue(manager.save(curr_step=5, last_step=True))
+            finally:
+                manager.close()
+            self.assertIsInstance(
+                manager._manager_config.storage_config, FsspecStorageConfig
+            )
+
+            restored = nn.Linear(2, 2)
+            loader = build(restored, load_only=True)
+            try:
+                self.assertTrue(loader.load())
+            finally:
+                loader.close()
+            torch.testing.assert_close(restored.weight, saved.weight)
+
     def test_caller_supplied_storage_config_wins_for_a_remote_folder(self) -> None:
         storage_config = mock.Mock()
         storage_config.create_storage.return_value = mock.Mock()
@@ -304,6 +343,29 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
         manager, _ = self._build_manager(config, storage_config=storage_config)
 
         self.assertIs(storage_config, manager._manager_config.storage_config)
+        manager.close()
+
+        # A storage the folder's URI cannot be on would silently drop the
+        # scheme: gs://bucket/run becomes the local relative path bucket/run.
+        for mismatched in (
+            LocalFileSystemStorageConfig(),
+            FsspecStorageConfig(protocol="s3"),
+        ):
+            with self.subTest(storage_config=mismatched):
+                with self.assertRaisesRegex(ValueError, "storage_config"):
+                    self._build_manager(config, storage_config=mismatched)
+
+        # The reverse: a local folder on remote storage would turn
+        # /tmp/checkpoint into gs://tmp/checkpoint. fsspec's local filesystem
+        # holds it as is.
+        local_config = TorchCheckpointingManager.Config(keep_latest_k=0)
+        with self.assertRaisesRegex(ValueError, "storage_config"):
+            self._build_manager(
+                local_config, storage_config=FsspecStorageConfig(protocol="gs")
+            )
+        manager, _ = self._build_manager(
+            local_config, storage_config=FsspecStorageConfig(protocol="file")
+        )
         manager.close()
 
     def test_folder_and_initial_load_path_must_share_storage(self) -> None:
@@ -1448,24 +1510,18 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
         manager.close()
 
     def test_load_latest_ignores_incomplete_checkpoint_directories(self) -> None:
-        bucket = f"bucket-{uuid.uuid4().hex}"
-        memory_fs = fsspec.filesystem("memory")
-        self.addCleanup(
-            lambda: memory_fs.rm(bucket, recursive=True)
-            if memory_fs.exists(bucket)
-            else None
-        )
         with tempfile.TemporaryDirectory() as base_folder:
             checkpoint_folder = os.path.join(base_folder, "checkpoint")
-            memory_folder = f"{bucket}/checkpoint"
             for step in (2, 5):
                 checkpoint_id = os.path.join(checkpoint_folder, f"step-{step}")
                 os.makedirs(checkpoint_id)
                 with open(os.path.join(checkpoint_id, "metadata.pkl"), "wb"):
                     pass
-                memory_fs.pipe_file(f"{memory_folder}/step-{step}/metadata.pkl", b"")
-            os.makedirs(os.path.join(checkpoint_folder, "step-8"))
-            memory_fs.makedirs(f"{memory_folder}/step-8", exist_ok=True)
+            incomplete_checkpoint_id = os.path.join(checkpoint_folder, "step-8")
+            os.makedirs(incomplete_checkpoint_id)
+            # An interrupted save leaves its metadata behind, so the temporary
+            # directory looks complete. Resuming from it would build the id
+            # "step-9", which does not exist.
             # Neither is a checkpoint id we could reconstruct: "tmp_step-9" is
             # an interrupted save whose metadata already landed, so it looks
             # complete, and "step-99.partial" is not a name we write at all.
@@ -1475,34 +1531,53 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
                 os.makedirs(decoy_id)
                 with open(os.path.join(decoy_id, "metadata.pkl"), "wb"):
                     pass
-                memory_fs.pipe_file(f"{memory_folder}/{decoy}/metadata.pkl", b"")
-            # file:// and memory://<bucket>/ go through the real fsspec storage;
-            # the authority-bearing memory:// URI also catches Path() collapsing
-            # the double slash the way it would on gs://<bucket>/.
-            for folder, expected_id in (
-                ("checkpoint", os.path.join(checkpoint_folder, "step-5")),
-                (
-                    f"file://{checkpoint_folder}",
-                    os.path.join(checkpoint_folder, "step-5"),
-                ),
-                (f"memory://{memory_folder}", f"{memory_folder}/step-5"),
-            ):
-                with self.subTest(folder=folder):
-                    config = TorchCheckpointingManager.Config(
-                        folder=folder,
-                        keep_latest_k=0,
-                        initial_load_model_only=False,
-                        load_only=True,
-                    )
-                    manager, backend_manager = self._build_manager(
-                        config,
-                        base_folder=base_folder,
-                    )
+            config = TorchCheckpointingManager.Config(
+                folder="checkpoint",
+                keep_latest_k=0,
+                initial_load_model_only=False,
+                load_only=True,
+            )
+            manager, backend_manager = self._build_manager(
+                config,
+                base_folder=base_folder,
+            )
 
-                    self.assertTrue(manager.load())
+            self.assertTrue(manager.load())
 
-                    self.assertEqual(
-                        expected_id,
-                        backend_manager.load_calls[0][0],
-                    )
-                    manager.close()
+            self.assertEqual(
+                os.path.join(checkpoint_folder, "step-5"),
+                backend_manager.load_calls[0][0],
+            )
+            manager.close()
+
+    def test_load_latest_on_remote_folder_ignores_incomplete_checkpoint_directories(
+        self,
+    ) -> None:
+        bucket = f"bucket-{uuid.uuid4().hex}"
+        memory_fs = fsspec.filesystem("memory")
+        self.addCleanup(
+            lambda: memory_fs.rm(bucket, recursive=True)
+            if memory_fs.exists(bucket)
+            else None
+        )
+        memory_folder = f"{bucket}/checkpoint"
+        for step in (2, 5):
+            memory_fs.pipe_file(f"{memory_folder}/step-{step}/metadata.pkl", b"")
+        memory_fs.makedirs(f"{memory_folder}/step-8", exist_ok=True)
+        for decoy in ("tmp_step-9", "step-99.partial"):
+            memory_fs.pipe_file(f"{memory_folder}/{decoy}/metadata.pkl", b"")
+        config = TorchCheckpointingManager.Config(
+            folder=f"memory://{memory_folder}",
+            keep_latest_k=0,
+            initial_load_model_only=False,
+            load_only=True,
+        )
+        manager, backend_manager = self._build_manager(config)
+
+        self.assertTrue(manager.load())
+
+        self.assertEqual(
+            f"{memory_folder}/step-5",
+            backend_manager.load_calls[0][0],
+        )
+        manager.close()
