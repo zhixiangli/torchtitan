@@ -298,16 +298,22 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
     def test_remote_folder_round_trip_replaces_an_interrupted_commit(self) -> None:
         """Save and resume through a URI folder with the real backend.
 
-        step-5 starts out as an interrupted commit left it on a flat bucket:
-        some shards, no metadata. The backend refuses to rename onto it, so
-        the save must clear it first.
+        step-5 starts out as an interrupted save left it on a flat bucket: a
+        partly moved step-5 without metadata, and a staging directory holding
+        a shard nothing rewrites. The backend refuses to rename onto step-5,
+        and would publish the stale shard, so the save must clear both.
         """
         with tempfile.TemporaryDirectory() as base_folder:
             folder = f"file://{base_folder}/checkpoint"
             interrupted = os.path.join(base_folder, "checkpoint", "step-5")
-            os.makedirs(interrupted)
-            with open(os.path.join(interrupted, "stale_shard.pt"), "wb") as f:
-                f.write(b"stale")
+            staging = os.path.join(base_folder, "checkpoint", "tmp_step-5")
+            for directory, name in (
+                (interrupted, "stale_shard.pt"),
+                (staging, "model_99.pt"),
+            ):
+                os.makedirs(directory)
+                with open(os.path.join(directory, name), "wb") as f:
+                    f.write(b"stale")
 
             def build(model: nn.Module, **overrides) -> TorchCheckpointingManager:
                 return TorchCheckpointingManager.Config(
@@ -335,6 +341,7 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
                 manager._manager_config.storage_config, FsspecStorageConfig
             )
             self.assertNotIn("stale_shard.pt", os.listdir(interrupted))
+            self.assertNotIn("model_99.pt", os.listdir(interrupted))
 
             restored = nn.Linear(2, 2)
             loader = build(restored, load_only=True)
@@ -602,25 +609,38 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
 
     def test_purge_runs_before_this_step_save_is_issued(self) -> None:
         # Purging while a save is in flight would let it see, and delete, that
-        # save's own temporary directory.
+        # save's own temporary directory. Every rank writes into that staging
+        # directory as soon as its save starts, so no rank may start before
+        # rank 0 has cleared the leftovers of an interrupted save.
         config = TorchCheckpointingManager.Config(
             interval=1,
             keep_latest_k=0,
             initial_load_model_only=False,
         )
         manager, backend_manager = self._build_manager(config)
+        # Cleanups run last-in first-out: resolve the save, then close, so a
+        # failed assertion does not leave close() waiting on the save.
+        self.addCleanup(manager.close)
+        self.addCleanup(backend_manager.save_result.set_result, None)
         calls = []
         backend_manager.save = lambda checkpoint_id, checkpoint: (
             calls.append("save"),
             backend_manager.save_result,
         )[1]
+        fake_dist = mock.Mock()
+        fake_dist.is_initialized.return_value = True
+        fake_dist.get_rank.return_value = 0
+        fake_dist.barrier.side_effect = lambda *args, **kwargs: calls.append("barrier")
 
-        with mock.patch.object(
-            manager,
-            "_purge_stale_checkpoints",
-            side_effect=lambda *, saving_step, staging_dir_prefix=None: calls.append(
-                ("purge", saving_step, staging_dir_prefix)
+        with (
+            mock.patch.object(
+                manager,
+                "_purge_stale_checkpoints",
+                side_effect=lambda *, saving_step, staging_dir_prefix=None: calls.append(
+                    ("purge", saving_step, staging_dir_prefix)
+                ),
             ),
+            mock.patch.object(manager_module, "dist", fake_dist),
         ):
             self.assertTrue(manager.save(curr_step=1))
 
@@ -631,12 +651,11 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
                     1,
                     manager._manager_config.save.writer_config.temp_dir_prefix,
                 ),
+                "barrier",
                 "save",
             ],
             calls,
         )
-        backend_manager.save_result.set_result(None)
-        manager.close()
 
     def _purge_manager(self, keep_latest_k: int, entries: list[str]):
         manager = TorchCheckpointingManager.__new__(TorchCheckpointingManager)

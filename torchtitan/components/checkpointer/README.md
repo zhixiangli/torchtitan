@@ -105,7 +105,8 @@ remote store. Limitations:
   Where the store has a real directory rename (a GCS bucket with hierarchical namespace,
   including zonal buckets) the rename is atomic. On a flat bucket it is a per-object move,
   so a crash during the commit leaves a `step-N` without metadata: resume skips it, and
-  saving that step again replaces it.
+  saving that step again replaces it, along with the staging directory the interrupted
+  save left.
 
 ## Creating a seed checkpoint
 Sometimes one needs to create a seed checkpoint to initialize a model from step 0.

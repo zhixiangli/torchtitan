@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import logging
+import posixpath
 import queue
 import threading
 from collections.abc import Callable
@@ -484,11 +485,12 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         # metric reports step=None.
         checkpoint_logging_context.update(step=curr_step)
         self.maybe_wait_for_saving()
-        self._remove_incomplete_checkpoint(
+        checkpoint_id = (
             self._create_last_step_id(curr_step)
             if last_step
             else self._create_checkpoint_id(curr_step)
         )
+        self._remove_stale_destination(checkpoint_id)
         # Always preserve the current step's published and staging directories.
         self._purge_stale_checkpoints(
             saving_step=curr_step,
@@ -496,6 +498,10 @@ class TorchCheckpointingManager(BaseCheckpointManager):
                 self._manager_config.save.writer_config.temp_dir_prefix
             ),
         )
+        # Every rank writes into the staging directory as soon as its save
+        # starts, so none may start until rank 0 has cleared it.
+        if dist.is_initialized():
+            dist.barrier()
 
         if last_step:
             self._save_last_step(curr_step)
@@ -508,25 +514,34 @@ class TorchCheckpointingManager(BaseCheckpointManager):
 
         return True
 
-    def _remove_incomplete_checkpoint(self, checkpoint_id: str) -> None:
-        """Delete what an interrupted commit left at ``checkpoint_id``.
+    def _remove_stale_destination(self, checkpoint_id: str) -> None:
+        """Delete what saving to ``checkpoint_id`` would refuse or publish.
 
-        The backend renames a finished save onto its final path and refuses an
-        occupied one. A commit interrupted on a store whose directory rename is
-        a per-object move (a flat bucket) leaves that path partly moved and
-        without metadata, so saving the same step again after the restart would
-        fail. Only rank 0 commits, and only after every rank has written, so
-        removing it here cannot race this save.
+        The backend stages a save in ``<parent>/<temp_dir_prefix><name>`` and
+        renames it onto ``checkpoint_id``, refusing an occupied destination. An
+        interrupted save leaves either behind: on a flat bucket a partly moved
+        ``checkpoint_id`` without metadata, and a staging directory whose
+        leftover files the rename would publish.
+
+        Only rank 0 deletes; ``_save`` holds the other ranks at a barrier until
+        it is done, since they write into the staging directory right away.
         """
         if dist.is_initialized() and dist.get_rank() != 0:
             return
         if self._storage.isdir(checkpoint_id) and not self._is_valid_checkpoint(
             checkpoint_id
         ):
-            logger.warning(
-                f"Removing incomplete checkpoint {checkpoint_id} before saving over it."
-            )
+            logger.warning(f"Removing {checkpoint_id} before saving over it.")
             self._storage.remove(checkpoint_id)
+        parent, name = posixpath.split(checkpoint_id.rstrip("/"))
+        prefix = self._manager_config.save.writer_config.temp_dir_prefix
+        staging_id = filesystem.join(parent, f"{prefix}{name}")
+        if self._storage.isdir(staging_id):
+            logger.warning(
+                f"Removing {staging_id}, left by an interrupted save, before "
+                "staging this save in it."
+            )
+            self._storage.remove(staging_id)
 
     def _is_resumable_checkpoint(self, checkpoint_dir: str) -> bool:
         """Whether automatic loading may select ``checkpoint_dir``.
