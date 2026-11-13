@@ -104,25 +104,39 @@ class _BackendCheckpointStorage:
     directories leaves exactly the existing non-directory entries.
 
     Paths arrive as ``str`` and may be remote URIs. The backend addresses
-    storage by scheme-less ``Path``, so the scheme is dropped here; the
-    protocol was already used to select the ``Storage`` this class wraps.
+    storage by scheme-less ``Path``, so ``backend_path`` drops the scheme once
+    it matches the protocol that selected the wrapped ``Storage``. A path on
+    other storage is rejected rather than rewritten into a path on this one.
+    The manager converts every checkpoint id it hands the backend the same way.
     """
 
-    def __init__(self, storage: Storage) -> None:
+    def __init__(self, storage: Storage, *, protocol: str | None) -> None:
         self._storage = storage
+        self._protocol = protocol
+
+    def backend_path(self, path: str) -> str:
+        """``path`` as the backend addresses it: on this storage, scheme-less."""
+        protocol, backend_path = _split_uri(path)
+        if protocol != self._protocol:
+            raise ValueError(
+                f"{path!r} is not on the checkpoint storage "
+                f"({self._protocol or 'local'}); folder, initial_load_path and "
+                "hf_assets_path must all be on the same storage."
+            )
+        return backend_path
 
     def isdir(self, path: str) -> bool:
-        return self._storage.isdir(Path(_split_uri(path)[1]))
+        return self._storage.isdir(Path(self.backend_path(path)))
 
     def isfile(self, path: str) -> bool:
-        target = Path(_split_uri(path)[1])
+        target = Path(self.backend_path(path))
         return self._storage.exists(target) and not self._storage.isdir(target)
 
     def listdir(self, path: str) -> list[str]:
-        return self._storage.ls(Path(_split_uri(path)[1]))
+        return self._storage.ls(Path(self.backend_path(path)))
 
     def remove(self, path: str) -> None:
-        self._storage.rmdir(Path(_split_uri(path)[1]))
+        self._storage.rmdir(Path(self.backend_path(path)))
 
 
 def _init_subprocess_logging(
@@ -325,7 +339,13 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         storage_config = (
             self._manager_config.storage_config or LocalFileSystemStorageConfig()
         )
-        self._storage = _BackendCheckpointStorage(storage_config.create_storage())
+        backend_storage = _BackendCheckpointStorage(
+            storage_config.create_storage(), protocol=folder_protocol
+        )
+        self._storage = backend_storage
+        # Checkpoint ids handed to the backend take the same validated
+        # conversion as the path probes made through self._storage.
+        self._backend_path = backend_storage.backend_path
         self._prewarmed = False
 
         self.sd_adapter = sd_adapter
@@ -413,7 +433,7 @@ class TorchCheckpointingManager(BaseCheckpointManager):
             hf_manager = hf_config.build()
             try:
                 hf_manager.load(
-                    checkpoint_id,
+                    self._backend_path(checkpoint_id),
                     into={item_key: hf_state},
                     # Covers only the weights to_hf maps. Parameters an export
                     # does not carry, such as new LoRA adapters, are not in
@@ -429,7 +449,7 @@ class TorchCheckpointingManager(BaseCheckpointManager):
             # here: the checkpoint lacks the new adapter parameters. Exempt them
             # on an initial load, as the HF path above already does.
             loaded = self._manager.load(
-                _split_uri(checkpoint_id)[1],
+                self._backend_path(checkpoint_id),
                 into=state_dict,
                 strict=True,
             )
@@ -470,7 +490,7 @@ class TorchCheckpointingManager(BaseCheckpointManager):
             self._save_last_step(curr_step)
         else:
             self.save_future = self._manager.save(
-                _split_uri(self._create_checkpoint_id(curr_step))[1],
+                self._backend_path(self._create_checkpoint_id(curr_step)),
                 _stateful_to_state_dict(self.states),
             )
             self._prewarmed = True
@@ -593,6 +613,7 @@ class TorchCheckpointingManager(BaseCheckpointManager):
             hf_storage_config = storage_config or LocalFileSystemStorageConfig(
                 use_direct_io=False
             )
+            output_dir = self._backend_path(checkpoint_id)
 
             # The backend invokes the callback after each rank finishes writing
             # but before the write barrier and the atomic rename of the
@@ -605,7 +626,7 @@ class TorchCheckpointingManager(BaseCheckpointManager):
                     dist.barrier()
                 consolidate_hf_safetensors_checkpoint(
                     args.path,
-                    output_dir=checkpoint_id,
+                    output_dir=output_dir,
                     item_key=MODEL,
                     fqn_to_index_mapping=fqn_to_index_mapping,
                     storage_config=hf_storage_config,
@@ -620,7 +641,7 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         manager = manager_config.build()
         try:
             manager.save(
-                _split_uri(input_checkpoint_id)[1],
+                self._backend_path(input_checkpoint_id),
                 _stateful_to_state_dict(states),
             )
         finally:

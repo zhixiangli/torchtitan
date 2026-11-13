@@ -278,6 +278,21 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
         )
         manager.close()
 
+    def test_storage_rejects_a_path_on_other_storage(self) -> None:
+        # Dropping the scheme of a path on other storage would turn
+        # gs://bucket/hf into the local relative path bucket/hf.
+        for protocol, path in (
+            (None, "gs://bucket/hf"),
+            ("gs", "/data/hf"),
+            ("gs", "s3://bucket/hf"),
+        ):
+            with self.subTest(protocol=protocol, path=path):
+                storage = mock.Mock()
+                adapter = _BackendCheckpointStorage(storage, protocol=protocol)
+                with self.assertRaisesRegex(ValueError, "same storage"):
+                    adapter.isdir(path)
+                storage.isdir.assert_not_called()
+
     def test_caller_supplied_storage_config_wins_for_a_remote_folder(self) -> None:
         storage_config = mock.Mock()
         storage_config.create_storage.return_value = mock.Mock()
@@ -768,7 +783,8 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
         # run's pre-save retention deletes abandoned directories outright.
         manager = TorchCheckpointingManager.__new__(TorchCheckpointingManager)
         manager._storage = _BackendCheckpointStorage(
-            LocalFileSystemStorageConfig(use_direct_io=False).create_storage()
+            LocalFileSystemStorageConfig(use_direct_io=False).create_storage(),
+            protocol=None,
         )
 
         for marker, is_resumable in (
