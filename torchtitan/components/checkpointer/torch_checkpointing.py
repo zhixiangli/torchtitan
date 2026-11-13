@@ -90,9 +90,10 @@ class _BackendCheckpointStorage:
 
     ``Path`` would mangle a remote URI -- it collapses the double slash in
     ``gs://bucket/x`` -- but every path arriving here is joined off
-    ``checkpointer.folder`` or ``checkpointer.initial_load_path``, and the manager
-    rejects a remote value for either at construction. So there is nothing left
-    to guard against by the time a path reaches this class.
+    ``checkpointer.folder``, ``checkpointer.initial_load_path``, or
+    ``sd_adapter.hf_assets_path`` (when used for initial HF load), and the
+    manager rejects a remote value for each at construction. So there is nothing
+    left to guard against by the time a path reaches this class.
     """
 
     def __init__(self, storage: Storage) -> None:
@@ -250,9 +251,17 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         # Checked here, not just in the storage adapter: a save runs no path
         # probe when retention is off, so it would otherwise reach the backend
         # and be mangled by Path() rather than failing.
+        hf_load_path = (
+            sd_adapter.hf_assets_path
+            if config.initial_load_in_hf
+            and not config.initial_load_path
+            and sd_adapter is not None
+            else None
+        )
         for label, candidate in (
             ("checkpointer.folder", self.folder),
             ("checkpointer.initial_load_path", config.initial_load_path),
+            ("hf_assets_path", hf_load_path),
         ):
             if candidate and filesystem.is_remote(candidate):
                 raise ValueError(

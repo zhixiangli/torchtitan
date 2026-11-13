@@ -207,14 +207,20 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
 
     def test_remote_checkpoint_paths_are_rejected_at_construction(self) -> None:
         # Path() would turn "gs://bucket/x" into "gs:/bucket/x". Rejecting the
-        # two roots up front is what lets every path derived from them be
+        # roots up front is what lets every path derived from them be
         # converted without a further check -- and a save with retention off
         # reaches the backend having run no probe that could have caught it.
-        for field, kwargs in (
-            ("checkpointer.folder", {"folder": "gs://bucket/checkpoint"}),
+        for field, kwargs, sd_adapter in (
+            ("checkpointer.folder", {"folder": "gs://bucket/checkpoint"}, None),
             (
                 "checkpointer.initial_load_path",
                 {"initial_load_path": "gs://bucket/pretrained"},
+                None,
+            ),
+            (
+                "hf_assets_path",
+                {"initial_load_in_hf": True},
+                _StateDictAdapter(hf_assets_path="gs://bucket/pretrained_hf"),
             ),
         ):
             with self.subTest(field=field):
@@ -224,7 +230,7 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
                     **kwargs,
                 )
                 with self.assertRaisesRegex(ValueError, rf"{field}.*not yet supported"):
-                    self._build_manager(config)
+                    self._build_manager(config, sd_adapter=sd_adapter)
 
     def test_storage_config_is_an_init_parameter_not_a_config_field(self) -> None:
         # Backend storage is a live object, so it is passed programmatically

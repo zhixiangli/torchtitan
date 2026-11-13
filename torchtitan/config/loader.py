@@ -11,13 +11,13 @@ from __future__ import annotations
 import argparse
 import importlib
 import logging
-import os
 import pprint
 from typing import Any, get_args
 
 from torchtitan.config.configs import CommBackend
 from torchtitan.config.configurable import Configurable
 from torchtitan.config.override import OverrideConfig, parse_cli_imports
+from torchtitan.tools import filesystem
 
 
 logger = logging.getLogger(__name__)
@@ -195,7 +195,7 @@ class ConfigLoader:
         assets_path = getattr(config, "hf_assets_path", None)
         if assets_path is None:
             return
-        if not os.path.exists(assets_path):
+        if not filesystem.exists(assets_path):
             logger.warning("HF assets path %s does not exist!", assets_path)
         elif assets_path.endswith("tokenizer.model"):
             raise ValueError(

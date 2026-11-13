@@ -264,3 +264,19 @@ def test_cli_overrides_extend_the_top_level_rl_config() -> None:
         )
 
     assert config.override.imports == ["pkg.recipe", "pkg.cli"]
+
+
+def test_validate_assets_path_supports_remote_uri() -> None:
+    import fsspec
+    import uuid
+
+    fs = fsspec.filesystem("memory")
+    remote_dir = f"memory://test-assets-{uuid.uuid4().hex}/hf"
+    fs.makedirs(remote_dir, exist_ok=True)
+    try:
+        config = SimpleNamespace(hf_assets_path=remote_dir)
+        with mock.patch("torchtitan.config.loader.logger") as mock_logger:
+            ConfigLoader._validate_assets_path(config)
+        mock_logger.warning.assert_not_called()
+    finally:
+        fs.rm(remote_dir, recursive=True)
