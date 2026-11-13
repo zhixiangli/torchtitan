@@ -104,25 +104,37 @@ class _BackendCheckpointStorage:
     directories leaves exactly the existing non-directory entries.
 
     Paths arrive as ``str`` and may be remote URIs. The backend addresses
-    storage by scheme-less ``Path``, so the scheme is dropped here; the
-    protocol was already used to select the ``Storage`` this class wraps.
+    storage by scheme-less ``Path``, so the scheme is dropped here once it
+    matches the protocol that selected the wrapped ``Storage``. A path on other
+    storage is rejected rather than rewritten into a path on this one.
     """
 
-    def __init__(self, storage: Storage) -> None:
+    def __init__(self, storage: Storage, *, protocol: str | None) -> None:
         self._storage = storage
+        self._protocol = protocol
+
+    def _backend_path(self, path: str) -> Path:
+        protocol, backend_path = _split_uri(path)
+        if protocol != self._protocol:
+            raise ValueError(
+                f"{path!r} is not on the checkpoint storage "
+                f"({self._protocol or 'local'}); folder, initial_load_path and "
+                "hf_assets_path must all be on the same storage."
+            )
+        return Path(backend_path)
 
     def isdir(self, path: str) -> bool:
-        return self._storage.isdir(Path(_split_uri(path)[1]))
+        return self._storage.isdir(self._backend_path(path))
 
     def isfile(self, path: str) -> bool:
-        target = Path(_split_uri(path)[1])
+        target = self._backend_path(path)
         return self._storage.exists(target) and not self._storage.isdir(target)
 
     def listdir(self, path: str) -> list[str]:
-        return self._storage.ls(Path(_split_uri(path)[1]))
+        return self._storage.ls(self._backend_path(path))
 
     def remove(self, path: str) -> None:
-        self._storage.rmdir(Path(_split_uri(path)[1]))
+        self._storage.rmdir(self._backend_path(path))
 
 
 def _init_subprocess_logging(
@@ -325,7 +337,9 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         storage_config = (
             self._manager_config.storage_config or LocalFileSystemStorageConfig()
         )
-        self._storage = _BackendCheckpointStorage(storage_config.create_storage())
+        self._storage = _BackendCheckpointStorage(
+            storage_config.create_storage(), protocol=folder_protocol
+        )
         self._prewarmed = False
 
         self.sd_adapter = sd_adapter
