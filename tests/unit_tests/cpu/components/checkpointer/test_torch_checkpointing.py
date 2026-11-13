@@ -357,6 +357,16 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
         self.assertIs(storage_config, manager._manager_config.storage_config)
         manager.close()
 
+        # A storage the folder's URI cannot be on would silently drop the
+        # scheme: gs://bucket/run becomes the local relative path bucket/run.
+        for mismatched in (
+            LocalFileSystemStorageConfig(),
+            FsspecStorageConfig(protocol="s3"),
+        ):
+            with self.subTest(storage_config=mismatched):
+                with self.assertRaisesRegex(ValueError, "storage_config"):
+                    self._build_manager(config, storage_config=mismatched)
+
     def test_folder_and_initial_load_path_must_share_storage(self) -> None:
         # A manager has one storage, so it cannot read from one and write to
         # another.

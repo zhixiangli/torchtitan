@@ -294,6 +294,18 @@ class TorchCheckpointingManager(BaseCheckpointManager):
                 "checkpointer.initial_load_in_hf is not supported with a remote "
                 f"checkpointer.folder: {self.folder!r}"
             )
+        if storage_config is not None and folder_protocol is not None:
+            # Paths reach the backend without their scheme, so a storage that
+            # cannot hold the folder would quietly use another location:
+            # gs://bucket/run as the local relative path bucket/run.
+            if isinstance(storage_config, LocalFileSystemStorageConfig) or (
+                isinstance(storage_config, FsspecStorageConfig)
+                and storage_config.protocol != folder_protocol
+            ):
+                raise ValueError(
+                    f"storage_config {storage_config!r} cannot hold "
+                    f"checkpointer.folder {self.folder!r}."
+                )
         if storage_config is None and folder_protocol is not None:
             storage_config = FsspecStorageConfig(protocol=folder_protocol)
         self.interval = config.interval
