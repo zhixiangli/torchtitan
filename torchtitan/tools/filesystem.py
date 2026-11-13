@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import posixpath
 import shutil
+from typing import Any, IO
 
 
 def is_remote(path: str | os.PathLike) -> bool:
@@ -65,6 +66,17 @@ def isfile(path: str | os.PathLike) -> bool:
         fs, p = _resolve(path)
         return fs.isfile(p)
     return os.path.isfile(path)
+
+
+def open_file(path: str | os.PathLike, mode: str = "r") -> IO[Any]:
+    """Open ``path`` like the built-in ``open``, through fsspec for remote URIs.
+
+    Raises ``FileNotFoundError`` for a missing file on either backend.
+    """
+    if is_remote(path):
+        fs, p = _resolve(path)
+        return fs.open(p, mode)
+    return open(path, mode)
 
 
 def listdir(path: str | os.PathLike) -> list[str]:

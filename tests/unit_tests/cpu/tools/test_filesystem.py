@@ -111,6 +111,11 @@ class TestRemoteOps(unittest.TestCase):
         # otherwise a failed purge would kill the background purge thread.
         filesystem.rmtree(f"{self.root}/does-not-exist")
 
+    def test_open_file_missing_raises_file_not_found(self):
+        # StateDictAdapter treats FileNotFoundError as "no index", like local open().
+        with self.assertRaises(FileNotFoundError):
+            filesystem.open_file(f"{self.root}/missing.json")
+
 
 class _ListingCachingLocalFileSystem(LocalFileSystem):
     """``file://`` that caches directory listings, as gcsfs, s3fs and adlfs do."""

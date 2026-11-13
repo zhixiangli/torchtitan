@@ -49,6 +49,7 @@ from torchtitan.models.llama3 import MODEL_FLAVORS as LLAMA3_MODEL_FLAVORS
 from torchtitan.models.llama3.state_dict_adapter import Llama3StateDictAdapter
 from torchtitan.observability import structured_logger as sl
 from torchtitan.quantization._fsdp_tensor import _ShardedFSDPTensor
+from torchtitan.tools import filesystem
 
 
 # These tests name the checkpoint folder after the running test, so a bare
@@ -253,21 +254,28 @@ class TestCheckpointManager(unittest.TestCase):
         )
         manager.close()
 
-    def test_hf_save_skips_index_entries_the_model_does_not_write(self):
+    def _hf_save_manager(
+        self, hf_assets_path: str, weight_map: dict[str, str]
+    ) -> CheckpointManager:
+        index_path = filesystem.join(hf_assets_path, "model.safetensors.index.json")
+        with filesystem.open_file(index_path, "w") as f:
+            json.dump({"weight_map": weight_map}, f)
         build_config, max_context_length = LLAMA3_MODEL_FLAVORS["debugmodel"]
         config = build_config(
             attn_backend="flex",
             seq_len=max_context_length,
             parallelism=ParallelismConfig(),
         )
-        shard = "model-00001-of-00001.safetensors"
-        weight_map = {"model.norm.weight": shard, "mtp.fc.weight": shard}
-        index_path = os.path.join(self.test_folder, "model.safetensors.index.json")
-        with open(index_path, "w") as f:
-            json.dump({"weight_map": weight_map}, f)
         manager = CheckpointManager.__new__(CheckpointManager)
         manager.sd_adapter = Llama3StateDictAdapter(
-            config, hf_assets_path=self.test_folder
+            config, hf_assets_path=hf_assets_path
+        )
+        return manager
+
+    def test_hf_save_skips_index_entries_the_model_does_not_write(self):
+        shard = "model-00001-of-00001.safetensors"
+        manager = self._hf_save_manager(
+            self.test_folder, {"model.norm.weight": shard, "mtp.fc.weight": shard}
         )
         checkpoint_id = os.path.join(self.test_folder, "step-1")
 
@@ -282,39 +290,47 @@ class TestCheckpointManager(unittest.TestCase):
             self.assertEqual(list(f.keys()), ["model.norm.weight"])
 
     def test_hf_save_and_load_on_remote_folder(self):
-        build_config, max_context_length = LLAMA3_MODEL_FLAVORS["debugmodel"]
-        config = build_config(
-            attn_backend="flex",
-            seq_len=max_context_length,
-            parallelism=ParallelismConfig(),
-        )
-        shard = "model-00001-of-00001.safetensors"
-        index_path = os.path.join(self.test_folder, "model.safetensors.index.json")
-        with open(index_path, "w") as f:
-            json.dump({"weight_map": {"model.norm.weight": shard}}, f)
-        manager = CheckpointManager.__new__(CheckpointManager)
-        manager.sd_adapter = Llama3StateDictAdapter(
-            config, hf_assets_path=self.test_folder
-        )
         name = f"test-{uuid.uuid4().hex}"
         memory_fs = fsspec.filesystem("memory")
         self.addCleanup(memory_fs.rm, f"/{name}", recursive=True)
+        # The remote index splits the tensors across two files, so the saved
+        # layout shows the adapter read it.
+        manager = self._hf_save_manager(
+            f"memory://{name}/assets",
+            {
+                "model.norm.weight": "model-00001-of-00002.safetensors",
+                "model.embed_tokens.weight": "model-00002-of-00002.safetensors",
+            },
+        )
         checkpoint_id = f"memory://{name}/step-1"
+        state_dict = {
+            "norm.weight": torch.arange(4.0),
+            "tok_embeddings.weight": torch.arange(8.0).view(2, 4),
+        }
 
         manager.dcp_save(
-            {"norm.weight": torch.arange(4.0)},
-            checkpoint_id,
-            AsyncMode.DISABLED,
-            to_hf=True,
+            dict(state_dict), checkpoint_id, AsyncMode.DISABLED, to_hf=True
         )
 
-        self.assertTrue(memory_fs.exists(f"/{name}/step-1/{shard}"))
-        loaded = {"model.norm.weight": torch.zeros(4)}
+        for shard in (
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+        ):
+            self.assertTrue(memory_fs.exists(f"/{name}/step-1/{shard}"))
+        loaded = {
+            "model.norm.weight": torch.zeros(4),
+            "model.embed_tokens.weight": torch.zeros(2, 4),
+        }
         dist_checkpoint.load(
             loaded,
             storage_reader=manager.sd_adapter.get_hf_storage_reader(checkpoint_id),
         )
-        torch.testing.assert_close(loaded["model.norm.weight"], torch.arange(4.0))
+        torch.testing.assert_close(
+            loaded["model.norm.weight"], state_dict["norm.weight"]
+        )
+        torch.testing.assert_close(
+            loaded["model.embed_tokens.weight"], state_dict["tok_embeddings.weight"]
+        )
 
     def setUp(self):
         self.base_temp_dir = tempfile.mkdtemp()

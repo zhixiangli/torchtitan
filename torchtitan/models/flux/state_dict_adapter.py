@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 from collections import defaultdict
 from typing import Any, TYPE_CHECKING
@@ -16,6 +15,7 @@ from typing import Any, TYPE_CHECKING
 import torch
 
 from torchtitan.models.base.state_dict_adapter import StateDictAdapter
+from torchtitan.tools import filesystem
 
 if TYPE_CHECKING:
     from .model import FluxModel
@@ -36,8 +36,8 @@ class FluxStateDictAdapter(StateDictAdapter):
         # Build fqn to index mapping if hf_assets_path
         if hf_assets_path:
             # If directory is multimodal ensure that hf_assets_path is to the folder containing transformer's safetensors
-            if os.path.exists(os.path.join(hf_assets_path, "model_index.json")):
-                hf_assets_path = os.path.join(hf_assets_path, "transformers")
+            if filesystem.exists(filesystem.join(hf_assets_path, "model_index.json")):
+                hf_assets_path = filesystem.join(hf_assets_path, "transformers")
 
             # Check if safetensors index file exists
             index_files = [
@@ -47,9 +47,9 @@ class FluxStateDictAdapter(StateDictAdapter):
 
             hf_safetensors_indx = None
             for index_file in index_files:
-                mapping_path = os.path.join(hf_assets_path, index_file)
-                if os.path.exists(mapping_path):
-                    with open(mapping_path, "r") as f:
+                mapping_path = filesystem.join(hf_assets_path, index_file)
+                if filesystem.exists(mapping_path):
+                    with filesystem.open_file(mapping_path, "r") as f:
                         hf_safetensors_indx = json.load(f)
                     break
             if hf_safetensors_indx is None:

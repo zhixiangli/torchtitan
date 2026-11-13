@@ -8,7 +8,6 @@ import functools
 import json
 
 import logging
-import os
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Collection
@@ -19,6 +18,8 @@ from torch.distributed.checkpoint import HuggingFaceStorageReader
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor.placement_types import Placement
+
+from torchtitan.tools import filesystem
 
 from .model import BaseModel
 
@@ -187,9 +188,11 @@ class StateDictAdapter(BaseStateDictAdapter):
             str, tuple[DeviceMesh, tuple[Placement, ...]]
         ] = {}
         if hf_assets_path:
-            mapping_path = os.path.join(hf_assets_path, "model.safetensors.index.json")
+            mapping_path = filesystem.join(
+                hf_assets_path, "model.safetensors.index.json"
+            )
             try:
-                with open(mapping_path, "r") as f:
+                with filesystem.open_file(mapping_path, "r") as f:
                     hf_safetensors_indx = json.load(f)
             except FileNotFoundError:
                 logger.warning(

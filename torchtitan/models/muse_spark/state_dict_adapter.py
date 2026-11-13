@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -22,6 +21,7 @@ from torch.distributed.tensor import DTensor, Replicate, Shard
 from torchtitan.models.common.feed_forward import DenseFeedForward
 from torchtitan.models.common.moe import MoE
 from torchtitan.models.common.moe.state_dict_adapter import MoEStateDictAdapter
+from torchtitan.tools import filesystem
 
 if TYPE_CHECKING:
     from torchtitan.models.muse_spark.model import MuseSparkModel
@@ -575,12 +575,12 @@ class MuseSparkStateDictAdapter(MoEStateDictAdapter):
         if self.hf_assets_path is None:
             self.fqn_to_index_mapping = None
             return
-        index_path = os.path.join(
+        index_path = filesystem.join(
             self.hf_assets_path,
             "model.safetensors.index.json",
         )
         try:
-            with open(index_path) as index_file:
+            with filesystem.open_file(index_path) as index_file:
                 index = json.load(index_file)
         except FileNotFoundError:
             self.fqn_to_index_mapping = None
