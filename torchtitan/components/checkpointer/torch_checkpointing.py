@@ -490,7 +490,12 @@ class TorchCheckpointingManager(BaseCheckpointManager):
             if last_step
             else self._create_checkpoint_id(curr_step)
         )
-        self._remove_stale_destination(checkpoint_id)
+        # An export is never a resume source, so a relaunched job that reaches
+        # its last step again replaces the export an earlier attempt wrote.
+        self._remove_stale_destination(
+            checkpoint_id,
+            replace_valid=checkpoint_id != self._create_checkpoint_id(curr_step),
+        )
         # Always preserve the current step's published and staging directories.
         self._purge_stale_checkpoints(
             saving_step=curr_step,
@@ -514,22 +519,25 @@ class TorchCheckpointingManager(BaseCheckpointManager):
 
         return True
 
-    def _remove_stale_destination(self, checkpoint_id: str) -> None:
+    def _remove_stale_destination(
+        self, checkpoint_id: str, *, replace_valid: bool
+    ) -> None:
         """Delete what saving to ``checkpoint_id`` would refuse or publish.
 
         The backend stages a save in ``<parent>/<temp_dir_prefix><name>`` and
         renames it onto ``checkpoint_id``, refusing an occupied destination. An
         interrupted save leaves either behind: on a flat bucket a partly moved
         ``checkpoint_id`` without metadata, and a staging directory whose
-        leftover files the rename would publish.
+        leftover files the rename would publish. ``replace_valid`` also deletes
+        a complete checkpoint at ``checkpoint_id``.
 
         Only rank 0 deletes; ``_save`` holds the other ranks at a barrier until
         it is done, since they write into the staging directory right away.
         """
         if dist.is_initialized() and dist.get_rank() != 0:
             return
-        if self._storage.isdir(checkpoint_id) and not self._is_valid_checkpoint(
-            checkpoint_id
+        if self._storage.isdir(checkpoint_id) and (
+            replace_valid or not self._is_valid_checkpoint(checkpoint_id)
         ):
             logger.warning(f"Removing {checkpoint_id} before saving over it.")
             self._storage.remove(checkpoint_id)

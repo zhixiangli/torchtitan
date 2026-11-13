@@ -40,6 +40,9 @@ from torch_checkpointing.hf.metadata import (
     HuggingFaceSafetensorsDistributedMetadataFormat,
 )
 from torch_checkpointing.logging_utils import checkpoint_logging_context
+from torch_checkpointing.metadata_serialization import (
+    METADATA_FILE_NAME as TORCH_CHECKPOINTING_METADATA_FILE_NAME,
+)
 from torch_checkpointing.schema import ItemSpec
 from torch_checkpointing.storage.filesystem import LocalFileSystemStorageConfig
 from torch_checkpointing.storage.fsspec_storage import FsspecStorageConfig
@@ -302,6 +305,8 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
         partly moved step-5 without metadata, and a staging directory holding
         a shard nothing rewrites. The backend refuses to rename onto step-5,
         and would publish the stale shard, so the save must clear both.
+        A relaunched job then exports step 5 twice; the second export must
+        replace the first instead of failing on it.
         """
         with tempfile.TemporaryDirectory() as base_folder:
             folder = f"file://{base_folder}/checkpoint"
@@ -316,11 +321,11 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
                     f.write(b"stale")
 
             def build(model: nn.Module, **overrides) -> TorchCheckpointingManager:
+                overrides.setdefault("last_save_model_only", False)
                 return TorchCheckpointingManager.Config(
                     folder=folder,
                     keep_latest_k=0,
                     initial_load_model_only=False,
-                    last_save_model_only=False,
                     **overrides,
                 ).build(
                     model_parts=[model],
@@ -350,6 +355,15 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
             finally:
                 loader.close()
             torch.testing.assert_close(restored.weight, saved.weight)
+
+            for _ in range(2):
+                exporter = build(saved, last_save_model_only=True)
+                try:
+                    self.assertTrue(exporter.save(curr_step=5, last_step=True))
+                finally:
+                    exporter.close()
+            export = os.path.join(base_folder, "checkpoint", "exports", "step-5")
+            self.assertIn(TORCH_CHECKPOINTING_METADATA_FILE_NAME, os.listdir(export))
 
     def test_caller_supplied_storage_config_wins_for_a_remote_folder(self) -> None:
         storage_config = mock.Mock()

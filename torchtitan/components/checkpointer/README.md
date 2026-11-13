@@ -106,7 +106,8 @@ remote store. Limitations:
   including zonal buckets) the rename is atomic. On a flat bucket it is a per-object move,
   so a crash during the commit leaves a `step-N` without metadata: resume skips it, and
   saving that step again replaces it, along with the staging directory the interrupted
-  save left.
+  save left. Saving the final export (`exports/step-N`) again, e.g. when a job that
+  already finished is relaunched, replaces the earlier export.
 
 ## Creating a seed checkpoint
 Sometimes one needs to create a seed checkpoint to initialize a model from step 0.
