@@ -472,6 +472,11 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         # metric reports step=None.
         checkpoint_logging_context.update(step=curr_step)
         self.maybe_wait_for_saving()
+        self._remove_incomplete_checkpoint(
+            self._create_last_step_id(curr_step)
+            if last_step
+            else self._create_checkpoint_id(curr_step)
+        )
         # Always preserve the current step's published and staging directories.
         self._purge_stale_checkpoints(
             saving_step=curr_step,
@@ -490,6 +495,26 @@ class TorchCheckpointingManager(BaseCheckpointManager):
             self._prewarmed = True
 
         return True
+
+    def _remove_incomplete_checkpoint(self, checkpoint_id: str) -> None:
+        """Delete what an interrupted commit left at ``checkpoint_id``.
+
+        The backend renames a finished save onto its final path and refuses an
+        occupied one. A commit interrupted on a store whose directory rename is
+        a per-object move (a flat bucket) leaves that path partly moved and
+        without metadata, so saving the same step again after the restart would
+        fail. Only rank 0 commits, and only after every rank has written, so
+        removing it here cannot race this save.
+        """
+        if dist.is_initialized() and dist.get_rank() != 0:
+            return
+        if self._storage.isdir(checkpoint_id) and not self._is_valid_checkpoint(
+            checkpoint_id
+        ):
+            logger.warning(
+                f"Removing incomplete checkpoint {checkpoint_id} before saving over it."
+            )
+            self._storage.remove(checkpoint_id)
 
     def _is_resumable_checkpoint(self, checkpoint_dir: str) -> bool:
         """Whether automatic loading may select ``checkpoint_dir``.

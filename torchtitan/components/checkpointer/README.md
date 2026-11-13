@@ -101,11 +101,11 @@ remote store. Limitations:
   with the same protocol.
 - Hugging Face export (`last_save_in_hf`) and load (`initial_load_in_hf`) are not supported
   with a remote folder.
-- A checkpoint is committed by renaming its temp directory. Where the store has a real
-  directory rename this is atomic. On a flat object-store bucket it is a per-object copy,
-  so a crash during the commit can leave a `step-N` that has its metadata but is missing
-  files. Loading it fails rather than resuming from partial weights; delete the directory
-  to resume from the previous checkpoint.
+- A checkpoint is committed by renaming its temp directory and then writing its metadata.
+  Where the store has a real directory rename (a GCS bucket with hierarchical namespace,
+  including zonal buckets) the rename is atomic. On a flat bucket it is a per-object move,
+  so a crash during the commit leaves a `step-N` without metadata: resume skips it, and
+  saving that step again replaces it.
 
 ## Creating a seed checkpoint
 Sometimes one needs to create a seed checkpoint to initialize a model from step 0.

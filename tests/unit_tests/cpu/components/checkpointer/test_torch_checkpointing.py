@@ -222,6 +222,8 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
             initial_load_model_only=False,
         )
         storage = mock.Mock()
+        # Nothing is at the save paths yet.
+        storage.isdir.return_value = False
         with mock.patch.object(
             FsspecStorageConfig, "create_storage", return_value=storage
         ):
@@ -292,6 +294,55 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "same storage"):
                     adapter.isdir(path)
                 storage.isdir.assert_not_called()
+
+    def test_remote_folder_round_trip_replaces_an_interrupted_commit(self) -> None:
+        """Save and resume through a URI folder with the real backend.
+
+        step-5 starts out as an interrupted commit left it on a flat bucket:
+        some shards, no metadata. The backend refuses to rename onto it, so
+        the save must clear it first.
+        """
+        with tempfile.TemporaryDirectory() as base_folder:
+            folder = f"file://{base_folder}/checkpoint"
+            interrupted = os.path.join(base_folder, "checkpoint", "step-5")
+            os.makedirs(interrupted)
+            with open(os.path.join(interrupted, "stale_shard.pt"), "wb") as f:
+                f.write(b"stale")
+
+            def build(model: nn.Module, **overrides) -> TorchCheckpointingManager:
+                return TorchCheckpointingManager.Config(
+                    folder=folder,
+                    keep_latest_k=0,
+                    initial_load_model_only=False,
+                    last_save_model_only=False,
+                    **overrides,
+                ).build(
+                    model_parts=[model],
+                    optimizers=_Stateful("optimizer"),
+                    lr_schedulers=_Stateful("scheduler"),
+                    ema=None,
+                    extra_states={"train_state": _Stateful("train")},
+                    sd_adapter=None,
+                )
+
+            saved = nn.Linear(2, 2)
+            manager = build(saved)
+            try:
+                self.assertTrue(manager.save(curr_step=5, last_step=True))
+            finally:
+                manager.close()
+            self.assertIsInstance(
+                manager._manager_config.storage_config, FsspecStorageConfig
+            )
+            self.assertNotIn("stale_shard.pt", os.listdir(interrupted))
+
+            restored = nn.Linear(2, 2)
+            loader = build(restored, load_only=True)
+            try:
+                self.assertTrue(loader.load())
+            finally:
+                loader.close()
+            torch.testing.assert_close(restored.weight, saved.weight)
 
     def test_caller_supplied_storage_config_wins_for_a_remote_folder(self) -> None:
         storage_config = mock.Mock()
