@@ -10,6 +10,8 @@ import logging
 import os
 import queue
 import tempfile
+import threading
+import time
 import unittest
 import uuid
 from concurrent.futures import Future
@@ -54,6 +56,7 @@ from torchtitan.components.checkpointer import (
     ModelWrapper,
     OPTIMIZER,
 )
+from torchtitan.components.checkpointer.base import purge_thread
 from torchtitan.components.checkpointer.torch_checkpointing import (
     _async_save_config,
     _BackendCheckpointStorage,
@@ -145,13 +148,17 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
         config: TorchCheckpointingManager.Config,
         *,
         storage_config=None,
-        base_folder: str = "/tmp",
+        base_folder: str | None = None,
         model_parts=None,
         optimizers=None,
         ema=None,
         extra_states=None,
         sd_adapter=None,
     ) -> tuple[TorchCheckpointingManager, _BackendManager]:
+        if base_folder is None:
+            temp_dir = tempfile.TemporaryDirectory()
+            self.addCleanup(temp_dir.cleanup)
+            base_folder = temp_dir.name
         backend_manager = _BackendManager()
         with mock.patch.object(
             BackendCheckpointManager.Config,
@@ -305,8 +312,9 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
         partly moved step-5 without metadata, and a staging directory holding
         a shard nothing rewrites. The backend refuses to rename onto step-5,
         and would publish the stale shard, so the save must clear both.
-        A relaunched job then exports step 5 twice; the second export must
-        replace the first instead of failing on it.
+        A job rolled back to an earlier step then saves step 5 again over the
+        complete checkpoint, and a relaunched job exports step 5 twice; each
+        save must replace what is there instead of failing on it.
         """
         with tempfile.TemporaryDirectory() as base_folder:
             folder = f"file://{base_folder}/checkpoint"
@@ -348,16 +356,33 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
             self.assertNotIn("stale_shard.pt", os.listdir(interrupted))
             self.assertNotIn("model_99.pt", os.listdir(interrupted))
 
+            def load_step_5_into(model: nn.Module) -> None:
+                loader = build(model, load_only=True)
+                try:
+                    self.assertTrue(loader.load())
+                finally:
+                    loader.close()
+
             restored = nn.Linear(2, 2)
-            loader = build(restored, load_only=True)
-            try:
-                self.assertTrue(loader.load())
-            finally:
-                loader.close()
+            load_step_5_into(restored)
             torch.testing.assert_close(restored.weight, saved.weight)
 
+            # Rolled back (checkpointer.load_step) or a re-run seed checkpoint:
+            # step-5 is complete, and the new save must replace it.
+            resaved = nn.Linear(2, 2)
+            manager = build(resaved)
+            try:
+                self.assertTrue(manager.save(curr_step=5, last_step=True))
+            finally:
+                manager.close()
+            self.assertNotIn(
+                "tmp_step-5", os.listdir(os.path.join(base_folder, "checkpoint"))
+            )
+            load_step_5_into(restored)
+            torch.testing.assert_close(restored.weight, resaved.weight)
+
             for _ in range(2):
-                exporter = build(saved, last_save_model_only=True)
+                exporter = build(resaved, last_save_model_only=True)
                 try:
                     self.assertTrue(exporter.save(curr_step=5, last_step=True))
                 finally:
@@ -387,6 +412,19 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
             with self.subTest(storage_config=mismatched):
                 with self.assertRaisesRegex(ValueError, "storage_config"):
                     self._build_manager(config, storage_config=mismatched)
+
+        # The reverse: a local folder on remote storage would turn
+        # /tmp/checkpoint into gs://tmp/checkpoint. fsspec's local filesystem
+        # holds it as is.
+        local_config = TorchCheckpointingManager.Config(keep_latest_k=0)
+        with self.assertRaisesRegex(ValueError, "storage_config"):
+            self._build_manager(
+                local_config, storage_config=FsspecStorageConfig(protocol="gs")
+            )
+        manager, _ = self._build_manager(
+            local_config, storage_config=FsspecStorageConfig(protocol="file")
+        )
+        manager.close()
 
     def test_folder_and_initial_load_path_must_share_storage(self) -> None:
         # A manager has one storage, so it cannot read from one and write to
@@ -489,7 +527,7 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
         self.assertTrue(manager.save(curr_step=3))
         self.assertEqual(1, len(backend_manager.save_calls))
         checkpoint_id, checkpoint = backend_manager.save_calls[0]
-        self.assertEqual("/tmp/checkpoint/step-3", checkpoint_id)
+        self.assertEqual(os.path.join(manager.folder, "step-3"), checkpoint_id)
         self.assertEqual("train", checkpoint["train_state"]["value"])
         self.assertIs(backend_manager.save_result, manager.save_future)
 
@@ -625,7 +663,8 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
         # Purging while a save is in flight would let it see, and delete, that
         # save's own temporary directory. Every rank writes into that staging
         # directory as soon as its save starts, so no rank may start before
-        # rank 0 has cleared the leftovers of an interrupted save.
+        # rank 0 has drained any in-flight purge and cleared the leftovers of
+        # an interrupted save.
         config = TorchCheckpointingManager.Config(
             interval=1,
             keep_latest_k=0,
@@ -635,7 +674,11 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
         # Cleanups run last-in first-out: resolve the save, then close, so a
         # failed assertion does not leave close() waiting on the save.
         self.addCleanup(manager.close)
-        self.addCleanup(backend_manager.save_result.set_result, None)
+        self.addCleanup(
+            lambda: backend_manager.save_result.set_result(None)
+            if not backend_manager.save_result.done()
+            else None
+        )
         calls = []
         backend_manager.save = lambda checkpoint_id, checkpoint: (
             calls.append("save"),
@@ -654,6 +697,13 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
                     ("purge", saving_step, staging_dir_prefix)
                 ),
             ),
+            mock.patch.object(
+                manager,
+                "_remove_stale_destination",
+                side_effect=lambda checkpoint_id: calls.append(
+                    ("remove_stale_destination", checkpoint_id)
+                ),
+            ),
             mock.patch.object(manager_module, "dist", fake_dist),
         ):
             self.assertTrue(manager.save(curr_step=1))
@@ -665,10 +715,108 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
                     1,
                     manager._manager_config.save.writer_config.temp_dir_prefix,
                 ),
+                (
+                    "remove_stale_destination",
+                    os.path.join(manager.folder, "step-1"),
+                ),
                 "barrier",
                 "save",
             ],
             calls,
+        )
+
+        # Non-zero ranks must not probe or delete the destination before the barrier.
+        backend_manager.save_result.set_result(None)
+        fake_dist.get_rank.return_value = 1
+        with (
+            mock.patch.object(manager, "_purge_stale_checkpoints"),
+            mock.patch.object(manager, "_storage") as storage_mock,
+            mock.patch.object(manager_module, "dist", fake_dist),
+        ):
+            self.assertTrue(manager.save(curr_step=2))
+            storage_mock.isdir.assert_not_called()
+            storage_mock.remove.assert_not_called()
+
+    def test_save_waits_for_in_flight_purge_before_removing_destination(self) -> None:
+        # If an earlier save queued step-2 for purge (e.g. after a rollback or
+        # crash recovery) and that delete is still running when step 2 is saved
+        # again, _remove_stale_destination and the new save would race with the
+        # purge thread on the same prefix unless _purge_stale_checkpoints drains
+        # the queue first.
+        purge_started = threading.Event()
+        allow_purge_finish = threading.Event()
+        events: list[str] = []
+
+        storage = mock.Mock(spec=CheckpointStorage)
+        storage.isdir.return_value = False
+
+        def slow_remove(path: str) -> None:
+            events.append(f"purge_start:{os.path.basename(path)}")
+            purge_started.set()
+            self.assertTrue(allow_purge_finish.wait(timeout=5.0))
+            events.append(f"purge_end:{os.path.basename(path)}")
+
+        storage.remove.side_effect = slow_remove
+
+        config = TorchCheckpointingManager.Config(
+            interval=1,
+            keep_latest_k=2,
+            initial_load_model_only=False,
+        )
+        manager, backend_manager = self._build_manager(config)
+        self.addCleanup(manager.close)
+        self.addCleanup(
+            lambda: backend_manager.save_result.set_result(None)
+            if not backend_manager.save_result.done()
+            else None
+        )
+        self.addCleanup(allow_purge_finish.set)
+        manager._storage = storage
+        # Rebuild the purge thread against our instrumented storage.remove.
+        manager.purge_queue.put(None)
+        manager.purge_thread.join(timeout=5.0)
+        manager.purge_queue = queue.Queue()
+        manager.purge_thread = threading.Thread(
+            target=purge_thread,
+            args=(manager.purge_queue, manager._storage.remove),
+            daemon=True,
+        )
+        manager.purge_thread.start()
+
+        manager.purge_queue.put(os.path.join(manager.folder, "step-2"))
+        self.assertTrue(purge_started.wait(timeout=5.0))
+
+        original_remove_stale = manager._remove_stale_destination
+
+        def record_remove_stale(checkpoint_id: str) -> None:
+            events.append(f"remove_stale:{os.path.basename(checkpoint_id)}")
+            original_remove_stale(checkpoint_id)
+
+        def release_purge_soon() -> None:
+            time.sleep(0.05)
+            allow_purge_finish.set()
+
+        releaser = threading.Thread(target=release_purge_soon, daemon=True)
+        releaser.start()
+
+        with (
+            mock.patch.object(
+                manager,
+                "_remove_stale_destination",
+                side_effect=record_remove_stale,
+            ),
+            mock.patch("torch.distributed.get_rank", return_value=0),
+        ):
+            self.assertTrue(manager.save(curr_step=2))
+
+        releaser.join(timeout=5.0)
+        self.assertEqual(
+            [
+                "purge_start:step-2",
+                "purge_end:step-2",
+                "remove_stale:step-2",
+            ],
+            events,
         )
 
     def _purge_manager(self, keep_latest_k: int, entries: list[str]):
@@ -810,7 +958,9 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
         self.assertTrue(backend_manager.closed)
         self.assertEqual(1, len(sync_manager.save_calls))
         checkpoint_id, checkpoint = sync_manager.save_calls[0]
-        self.assertEqual("/tmp/checkpoint/exports/step-5", checkpoint_id)
+        self.assertEqual(
+            os.path.join(manager.folder, "exports", "step-5"), checkpoint_id
+        )
         self.assertEqual({MODEL}, set(checkpoint))
         self.assertTrue(sync_manager.closed)
         sync_config = build.call_args.args[0]

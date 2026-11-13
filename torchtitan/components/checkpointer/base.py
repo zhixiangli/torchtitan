@@ -58,25 +58,30 @@ def purge_thread(
     try:
         while True:
             path = purge_queue.get()
-            if path is None:
-                return
-            logger.info("Checkpointer is deleting %s.", path)
-            begin = time.monotonic()
-            # A single failed deletion (e.g. a transient remote error) must not
-            # kill this daemon thread; otherwise keep_latest_k would silently
-            # stop purging for the rest of the run.
             try:
-                remove_path(path)
-            except Exception as error:
-                logger.warning(
-                    "Checkpointer failed to delete %s: %s. Skipping.", path, error
+                if path is None:
+                    return
+                logger.info("Checkpointer is deleting %s.", path)
+                begin = time.monotonic()
+                # A single failed deletion (e.g. a transient remote error) must not
+                # kill this daemon thread; otherwise keep_latest_k would silently
+                # stop purging for the rest of the run.
+                try:
+                    remove_path(path)
+                except Exception as error:
+                    logger.warning(
+                        "Checkpointer failed to delete %s: %s. Skipping.",
+                        path,
+                        error,
+                    )
+                    continue
+                logger.info(
+                    "Checkpointer deleted %s in %.2f seconds.",
+                    path,
+                    time.monotonic() - begin,
                 )
-                continue
-            logger.info(
-                "Checkpointer deleted %s in %.2f seconds.",
-                path,
-                time.monotonic() - begin,
-            )
+            finally:
+                purge_queue.task_done()
     finally:
         logger.info("Destroying the purge thread.")
 
@@ -555,6 +560,8 @@ class BaseCheckpointManager(Configurable, ABC):
         staging_dir_prefix: str | None = None,
     ) -> None:
         """Delete abandoned entries and reserve one retained slot for this save."""
+        if self.purge_thread is not None:
+            self.purge_queue.join()
         if self._should_purge():
             saving_dirnames = {f"step-{saving_step}"}
             if staging_dir_prefix:

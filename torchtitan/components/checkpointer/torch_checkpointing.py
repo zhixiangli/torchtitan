@@ -295,14 +295,23 @@ class TorchCheckpointingManager(BaseCheckpointManager):
                 "checkpointer.initial_load_in_hf is not supported with a remote "
                 f"checkpointer.folder: {self.folder!r}"
             )
-        if storage_config is not None and folder_protocol is not None:
+        if storage_config is not None:
             # Paths reach the backend without their scheme, so a storage that
             # cannot hold the folder would quietly use another location:
-            # gs://bucket/run as the local relative path bucket/run.
-            if isinstance(storage_config, LocalFileSystemStorageConfig) or (
-                isinstance(storage_config, FsspecStorageConfig)
-                and storage_config.protocol != folder_protocol
-            ):
+            # gs://bucket/run as the local relative path bucket/run, or the
+            # local /tmp/run as gs://tmp/run.
+            if folder_protocol is None:
+                mismatched = isinstance(
+                    storage_config, FsspecStorageConfig
+                ) and storage_config.protocol not in ("file", "local")
+            else:
+                mismatched = isinstance(
+                    storage_config, LocalFileSystemStorageConfig
+                ) or (
+                    isinstance(storage_config, FsspecStorageConfig)
+                    and storage_config.protocol != folder_protocol
+                )
+            if mismatched:
                 raise ValueError(
                     f"storage_config {storage_config!r} cannot hold "
                     f"checkpointer.folder {self.folder!r}."
@@ -490,12 +499,6 @@ class TorchCheckpointingManager(BaseCheckpointManager):
             if last_step
             else self._create_checkpoint_id(curr_step)
         )
-        # An export is never a resume source, so a relaunched job that reaches
-        # its last step again replaces the export an earlier attempt wrote.
-        self._remove_stale_destination(
-            checkpoint_id,
-            replace_valid=checkpoint_id != self._create_checkpoint_id(curr_step),
-        )
         # Always preserve the current step's published and staging directories.
         self._purge_stale_checkpoints(
             saving_step=curr_step,
@@ -503,6 +506,7 @@ class TorchCheckpointingManager(BaseCheckpointManager):
                 self._manager_config.save.writer_config.temp_dir_prefix
             ),
         )
+        self._remove_stale_destination(checkpoint_id)
         # Every rank writes into the staging directory as soon as its save
         # starts, so none may start until rank 0 has cleared it.
         if dist.is_initialized():
@@ -519,26 +523,23 @@ class TorchCheckpointingManager(BaseCheckpointManager):
 
         return True
 
-    def _remove_stale_destination(
-        self, checkpoint_id: str, *, replace_valid: bool
-    ) -> None:
+    def _remove_stale_destination(self, checkpoint_id: str) -> None:
         """Delete what saving to ``checkpoint_id`` would refuse or publish.
 
         The backend stages a save in ``<parent>/<temp_dir_prefix><name>`` and
-        renames it onto ``checkpoint_id``, refusing an occupied destination. An
-        interrupted save leaves either behind: on a flat bucket a partly moved
-        ``checkpoint_id`` without metadata, and a staging directory whose
-        leftover files the rename would publish. ``replace_valid`` also deletes
-        a complete checkpoint at ``checkpoint_id``.
+        renames it onto ``checkpoint_id``, refusing an occupied destination.
+        ``checkpoint_id`` may hold a partly moved commit, an earlier export, or
+        a complete checkpoint from before a rollback (``load_step``) or from a
+        re-run seed checkpoint; this save replaces it either way. A staging
+        directory left by an interrupted save is removed too, or the rename
+        would publish its leftover files.
 
         Only rank 0 deletes; ``_save`` holds the other ranks at a barrier until
         it is done, since they write into the staging directory right away.
         """
         if dist.is_initialized() and dist.get_rank() != 0:
             return
-        if self._storage.isdir(checkpoint_id) and (
-            replace_valid or not self._is_valid_checkpoint(checkpoint_id)
-        ):
+        if self._storage.isdir(checkpoint_id):
             logger.warning(f"Removing {checkpoint_id} before saving over it.")
             self._storage.remove(checkpoint_id)
         parent, name = posixpath.split(checkpoint_id.rstrip("/"))
