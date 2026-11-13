@@ -281,6 +281,41 @@ class TestCheckpointManager(unittest.TestCase):
         with safe_open(os.path.join(checkpoint_id, shard), "pt") as f:
             self.assertEqual(list(f.keys()), ["model.norm.weight"])
 
+    def test_hf_save_and_load_on_remote_folder(self):
+        build_config, max_context_length = LLAMA3_MODEL_FLAVORS["debugmodel"]
+        config = build_config(
+            attn_backend="flex",
+            seq_len=max_context_length,
+            parallelism=ParallelismConfig(),
+        )
+        shard = "model-00001-of-00001.safetensors"
+        index_path = os.path.join(self.test_folder, "model.safetensors.index.json")
+        with open(index_path, "w") as f:
+            json.dump({"weight_map": {"model.norm.weight": shard}}, f)
+        manager = CheckpointManager.__new__(CheckpointManager)
+        manager.sd_adapter = Llama3StateDictAdapter(
+            config, hf_assets_path=self.test_folder
+        )
+        name = f"test-{uuid.uuid4().hex}"
+        memory_fs = fsspec.filesystem("memory")
+        self.addCleanup(memory_fs.rm, f"/{name}", recursive=True)
+        checkpoint_id = f"memory://{name}/step-1"
+
+        manager.dcp_save(
+            {"norm.weight": torch.arange(4.0)},
+            checkpoint_id,
+            AsyncMode.DISABLED,
+            to_hf=True,
+        )
+
+        self.assertTrue(memory_fs.exists(f"/{name}/step-1/{shard}"))
+        loaded = {"model.norm.weight": torch.zeros(4)}
+        dist_checkpoint.load(
+            loaded,
+            storage_reader=manager.sd_adapter.get_hf_storage_reader(checkpoint_id),
+        )
+        torch.testing.assert_close(loaded["model.norm.weight"], torch.arange(4.0))
+
     def setUp(self):
         self.base_temp_dir = tempfile.mkdtemp()
         self.test_folder = os.path.join(self.base_temp_dir, self._testMethodName)
@@ -1348,25 +1383,18 @@ class TestConfigPostInit(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires last_save_model_only=True"):
             CheckpointManager.Config(last_save_in_hf=True, last_save_model_only=False)
 
-    def test_remote_hf_rejected(self):
-        """HF safetensors format is not supported with remote (fsspec) paths."""
-        with self.assertRaisesRegex(
-            ValueError, "last_save_in_hf is not supported with a remote"
-        ):
-            CheckpointManager.Config(
-                folder="gs://bucket/run",
-                last_save_in_hf=True,
-                last_save_model_only=True,
-            )
-
-        with self.assertRaisesRegex(
-            ValueError, "initial_load_in_hf is not supported with a remote"
-        ):
-            CheckpointManager.Config(
-                initial_load_in_hf=True,
-                initial_load_model_only=True,
-                initial_load_path="gs://bucket/run/step-1",
-            )
+    def test_remote_hf_accepted(self):
+        """HF safetensors format works with remote (fsspec) paths."""
+        CheckpointManager.Config(
+            folder="gs://bucket/run",
+            last_save_in_hf=True,
+            last_save_model_only=True,
+        )
+        CheckpointManager.Config(
+            initial_load_in_hf=True,
+            initial_load_model_only=True,
+            initial_load_path="gs://bucket/run/step-1",
+        )
 
     def test_mode_normalization(self):
         """Test that async_mode is case-normalized."""

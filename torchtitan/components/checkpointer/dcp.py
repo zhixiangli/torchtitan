@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import enum
 import logging
-import os
 import queue
 import threading
 import time
@@ -292,7 +291,7 @@ class CheckpointManager(BaseCheckpointManager):
 
             # If sharded, we save to a subdir then consolidate
             save_path = (
-                os.path.join(checkpoint_id, "sharded")
+                filesystem.join(checkpoint_id, "sharded")
                 if fqn_to_index_mapping
                 else checkpoint_id
             )
@@ -348,7 +347,7 @@ class CheckpointManager(BaseCheckpointManager):
             )
             assert fqn_to_index_mapping is not None
             consolidate_safetensors_files_on_every_rank(
-                input_dir=os.path.join(checkpoint_id, "sharded"),
+                input_dir=filesystem.join(checkpoint_id, "sharded"),
                 output_dir=checkpoint_id,
                 fqn_to_index_mapping=fqn_to_index_mapping,
                 num_threads=5,
