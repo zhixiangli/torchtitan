@@ -7,7 +7,6 @@
 
 import json
 import logging
-import os
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -15,6 +14,7 @@ from typing import Any, ClassVar
 
 from tokenizers import AddedToken, Tokenizer
 from torchtitan.config import Configurable
+from torchtitan.tools import filesystem
 
 
 logger = logging.getLogger(__name__)
@@ -140,7 +140,7 @@ class HuggingFaceTokenizer(BaseTokenizer):
 
         # Load configuration files
         self._hf_config = self._load_config(
-            os.path.join(tokenizer_path, "tokenizer_config.json")
+            filesystem.join(tokenizer_path, "tokenizer_config.json")
         )
         if self._hf_config is None:
             logger.warning(
@@ -158,23 +158,23 @@ class HuggingFaceTokenizer(BaseTokenizer):
         # (e.g. GPT-OSS), then fall back to inline in tokenizer_config.json
         # (e.g. Llama3, Qwen3, DeepSeek V3).
         if self._hf_config is not None:
-            jinja_path = os.path.join(tokenizer_path, self.CHAT_TEMPLATE_FILE)
-            if os.path.exists(jinja_path):
-                with open(jinja_path) as f:
+            jinja_path = filesystem.join(tokenizer_path, self.CHAT_TEMPLATE_FILE)
+            if filesystem.exists(jinja_path):
+                with filesystem.open_file(jinja_path) as f:
                     self.set_chat_template(f.read())
             elif "chat_template" in self._hf_config:
                 self.set_chat_template(self._hf_config["chat_template"])
 
     def _load_config(self, config_path: str) -> dict | None:
         """Load configuration from JSON file if it exists."""
-        if os.path.exists(config_path):
-            with open(config_path, "r") as f:
+        if filesystem.exists(config_path):
+            with filesystem.open_file(config_path, "r") as f:
                 return json.load(f)
         return None
 
     def _load_tokenizer_from_path(self, tokenizer_path: str) -> Tokenizer:
         """Load tokenizer from various file formats."""
-        if not os.path.exists(tokenizer_path):
+        if not filesystem.exists(tokenizer_path):
             if "assets/tokenizer" in tokenizer_path:
                 raise FileNotFoundError(
                     "Detected ./assets/tokenizer path which was deprecated in https://github.com/pytorch/torchtitan/pull/1540.\n"
@@ -188,27 +188,29 @@ class HuggingFaceTokenizer(BaseTokenizer):
                 )
 
         # Define paths for different tokenizer file types
-        tokenizer_json_path = os.path.join(tokenizer_path, "tokenizer.json")
-        vocab_txt_path = os.path.join(tokenizer_path, "vocab.txt")
-        vocab_json_path = os.path.join(tokenizer_path, "vocab.json")
-        merges_txt_path = os.path.join(tokenizer_path, "merges.txt")
+        tokenizer_json_path = filesystem.join(tokenizer_path, "tokenizer.json")
+        vocab_txt_path = filesystem.join(tokenizer_path, "vocab.txt")
+        vocab_json_path = filesystem.join(tokenizer_path, "vocab.json")
+        merges_txt_path = filesystem.join(tokenizer_path, "merges.txt")
 
         # Strategy 1: Load from tokenizer.json (preferred for modern tokenizers)
-        if os.path.exists(tokenizer_json_path):
+        if filesystem.exists(tokenizer_json_path):
             logger.info("Loading tokenizer from tokenizer.json")
-            return Tokenizer.from_file(tokenizer_json_path)
+            # Tokenizer.from_file only takes a local path.
+            with filesystem.open_file(tokenizer_json_path, "rb") as f:
+                return Tokenizer.from_str(f.read().decode("utf-8"))
         # Strategy 2: Load from vocab files (with or without merges.txt)
-        elif os.path.exists(vocab_json_path) or os.path.exists(vocab_txt_path):
+        elif filesystem.exists(vocab_json_path) or filesystem.exists(vocab_txt_path):
             # Load vocabulary
-            if os.path.exists(vocab_json_path):
+            if filesystem.exists(vocab_json_path):
                 logger.info("Loading vocabulary from vocab.json")
-                with open(vocab_json_path, "r") as f:
+                with filesystem.open_file(vocab_json_path, "r") as f:
                     vocab = json.load(f)
                 vocab_source = "vocab.json"
             else:
                 logger.info("Loading vocabulary from vocab.txt")
                 vocab = {}
-                with open(vocab_txt_path, "r") as f:
+                with filesystem.open_file(vocab_txt_path, "r") as f:
                     for i, line in enumerate(f):
                         token = line.strip()
                         if token:
@@ -216,14 +218,14 @@ class HuggingFaceTokenizer(BaseTokenizer):
                 vocab_source = "vocab.txt"
 
             # Strategy 2a: Use BPE if merges.txt exists
-            if os.path.exists(merges_txt_path):
+            if filesystem.exists(merges_txt_path):
                 logger.info(f"Loading BPE tokenizer from {vocab_source} + merges.txt")
                 from tokenizers import decoders, pre_tokenizers, processors
                 from tokenizers.models import BPE
 
                 # Load merges from file and convert to tuples
                 merges = []
-                with open(merges_txt_path, "r") as f:
+                with filesystem.open_file(merges_txt_path, "r") as f:
                     for line in f:
                         line = line.strip()
                         if line and not line.startswith(
@@ -258,8 +260,8 @@ class HuggingFaceTokenizer(BaseTokenizer):
             # List available files for debugging
             available_files = [
                 f
-                for f in os.listdir(tokenizer_path)
-                if os.path.isfile(os.path.join(tokenizer_path, f))
+                for f in filesystem.listdir(tokenizer_path)
+                if filesystem.isfile(filesystem.join(tokenizer_path, f))
             ]
             raise FileNotFoundError(
                 f"No supported tokenizer files found in '{tokenizer_path}'. "

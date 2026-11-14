@@ -9,7 +9,9 @@ import os
 import shutil
 import tempfile
 import unittest
+import uuid
 
+import fsspec
 from scripts.download_hf_assets import download_hf_assets
 from tokenizers import AddedToken, Tokenizer
 from tokenizers.models import WordLevel
@@ -575,6 +577,28 @@ class TestHuggingFaceChatTemplateAutoLoad(unittest.TestCase):
             result = tok.apply_chat_template(SAMPLE_MESSAGES)
             # Should use the .jinja file (just outputs content), not the inline ChatML
             self.assertEqual(result, "Hello")
+
+    def test_loads_from_remote_path(self):
+        """A remote hf_assets_path loads every tokenizer file, not just tokenizer.json.
+
+        A local-only existence check on a remote URI returns False, which would
+        silently drop the special tokens and the .jinja chat template.
+        """
+        fs = fsspec.filesystem("memory")
+        remote = f"memory://tokenizer-{uuid.uuid4().hex}"
+        self.addCleanup(fs.rm, remote, recursive=True)
+        fs.put(ASSETS_TOKENIZER, remote, recursive=True)
+        fs.pipe(f"{remote}/chat_template.jinja", b"{{ messages[0].content }}")
+        local = HuggingFaceTokenizer(tokenizer_path=ASSETS_TOKENIZER)
+
+        tok = HuggingFaceTokenizer(tokenizer_path=remote)
+
+        self.assertEqual((tok.bos_id, tok.eos_id), (local.bos_id, local.eos_id))
+        self.assertEqual(
+            tok.encode("hello world", add_bos=True, add_eos=True),
+            local.encode("hello world", add_bos=True, add_eos=True),
+        )
+        self.assertEqual(tok.apply_chat_template(SAMPLE_MESSAGES), "Hello")
 
     def test_hf_backend_renders_generation_tags(self):
         """HF {% generation %} tags (e.g. SmolLM3-3B) render as if they were absent."""
