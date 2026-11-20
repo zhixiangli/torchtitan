@@ -359,6 +359,65 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
                 loader.close()
             torch.testing.assert_close(restored.weight, saved.weight)
 
+    def test_remote_folder_round_trip_replaces_stale_destinations(self) -> None:
+        """Interval and final saves replace interrupted, orphan, and valid steps."""
+        with tempfile.TemporaryDirectory() as base_folder:
+            checkpoint_root = Path(base_folder) / "checkpoint"
+            folder = f"file://{checkpoint_root}"
+
+            # Pre-seed an interrupted commit (no metadata.pkl) and a leftover
+            # staging directory with an orphan shard.
+            (checkpoint_root / "step-5").mkdir(parents=True)
+            (checkpoint_root / "step-5" / "model_0.pt").write_bytes(b"partial")
+            (checkpoint_root / "tmp_step-5").mkdir(parents=True)
+            (checkpoint_root / "tmp_step-5" / "model_99.pt").write_bytes(b"orphan")
+
+            def build(model: nn.Module, **overrides) -> TorchCheckpointingManager:
+                return TorchCheckpointingManager.Config(
+                    folder=folder,
+                    keep_latest_k=0,
+                    initial_load_model_only=False,
+                    last_save_model_only=False,
+                    **overrides,
+                ).build(
+                    model_parts=[model],
+                    optimizers=_Stateful("optimizer"),
+                    lr_schedulers=_Stateful("scheduler"),
+                    ema=None,
+                    extra_states={"train_state": _Stateful("train")},
+                    sd_adapter=None,
+                )
+
+            model_a = nn.Linear(2, 2)
+            with torch.no_grad():
+                model_a.weight.fill_(1.0)
+            first_saver = build(model_a, interval=5)
+            try:
+                self.assertTrue(first_saver.save(curr_step=5))
+            finally:
+                first_saver.close()
+
+            self.assertFalse((checkpoint_root / "step-5" / "model_99.pt").exists())
+            self.assertFalse((checkpoint_root / "tmp_step-5").exists())
+            self.assertTrue((checkpoint_root / "step-5" / "metadata.pkl").is_file())
+
+            model_b = nn.Linear(2, 2)
+            with torch.no_grad():
+                model_b.weight.fill_(2.0)
+            second_saver = build(model_b)
+            try:
+                self.assertTrue(second_saver.save(curr_step=5, last_step=True))
+            finally:
+                second_saver.close()
+
+            restored = nn.Linear(2, 2)
+            loader = build(restored, load_only=True)
+            try:
+                self.assertTrue(loader.load())
+            finally:
+                loader.close()
+            torch.testing.assert_close(restored.weight, model_b.weight)
+
     def test_caller_supplied_storage_config_wins_for_a_remote_folder(self) -> None:
         storage_config = mock.Mock()
         storage_config.create_storage.return_value = mock.Mock()
@@ -500,7 +559,46 @@ class TorchCheckpointingManagerTest(unittest.TestCase):
                 base_folder=base_folder,
             )
 
+        first_saved = nn.Linear(2, 2, bias=False)
+        with torch.no_grad():
+            first_saved.weight.fill_(1.0)
+        first_manager = build(
+            first_saved,
+            _StateDictAdapter(),
+            initial_load_model_only=False,
+            last_save_model_only=True,
+            last_save_in_hf=True,
+        )
+        try:
+            self.assertTrue(first_manager.save(curr_step=5, last_step=True))
+        finally:
+            first_manager.close()
+        # A re-export cut short once consolidation has begun overwriting the
+        # earlier export must not leave that export's index over a mix of old
+        # and new files.
+        interrupted = build(
+            nn.Linear(2, 2, bias=False),
+            _StateDictAdapter(),
+            initial_load_model_only=False,
+            last_save_model_only=True,
+            last_save_in_hf=True,
+        )
+        try:
+            with (
+                mock.patch(
+                    "torch_checkpointing.hf.consolidation._write_overall_hf_index_file",
+                    side_effect=RuntimeError("interrupted"),
+                ),
+                self.assertRaises(RuntimeError),
+            ):
+                interrupted.save(curr_step=5, last_step=True)
+        finally:
+            interrupted.close()
+        self.assertFalse(memory_fs.exists(f"{export}/model.safetensors.index.json"))
+
         saved = nn.Linear(2, 2, bias=False)
+        with torch.no_grad():
+            saved.weight.fill_(3.0)
         manager = build(
             saved,
             _StateDictAdapter(),

@@ -238,6 +238,10 @@ def _writer_config(*, use_barrier: bool) -> CheckpointWriterConfig:
             if use_barrier
             else None
         ),
+        # Only saving configs carry a barrier; load-only configs never stage or
+        # commit.
+        write_to_temp_dir=use_barrier,
+        replace_existing=use_barrier,
     )
 
 
@@ -657,6 +661,19 @@ class TorchCheckpointingManager(BaseCheckpointManager):
             # shards into HF-layout files in the checkpoint directory.
             def pre_finalize_callback(args: CallbackArgs) -> None:  # noqa: F811
                 # Need all ranks to finish writing before any rank starts consolidating
+                if dist.is_initialized():
+                    dist.barrier()
+                # Consolidation overwrites an earlier export's files in place
+                # and writes the index last. Drop the old index first, so an
+                # interrupted re-export leaves no index rather than one over a
+                # mix of old and new files.
+                if not dist.is_initialized() or dist.get_rank() == 0:
+                    index_name = HF_SAFETENSORS_INDEX_FILE_TEMPLATE.format(
+                        item_key=MODEL
+                    )
+                    index = Path(output_dir) / index_name
+                    if args.storage.exists(index):
+                        args.storage.delete(index)
                 if dist.is_initialized():
                     dist.barrier()
                 consolidate_hf_safetensors_checkpoint(

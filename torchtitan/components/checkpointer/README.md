@@ -100,6 +100,11 @@ remote store. `initial_load_path` may be on other storage than `folder`, and a l
 `hf_assets_path` works with a remote `folder`, e.g. HF weights on local disk with
 checkpoints on `gs://`.
 
+A save replaces what is already at its path: a commit cut short on a flat bucket
+(resume skips it), a staging directory an interrupted save left, an earlier export, or
+a `step-N` from before a `load_step` rollback. See `torch_checkpointing`'s
+`docs/storage.md` for the commit sequence.
+
 ## Creating a seed checkpoint
 Sometimes one needs to create a seed checkpoint to initialize a model from step 0.
 E.g. it is hard, if not impossible, for meta initialization on multiple devices to reproduce the initialization on a single device.
